@@ -1,0 +1,165 @@
+# Distributed Video Processing & Transcoding Platform
+#   docker compose up -d --build      ->  UI http://localhost:3000   API http://localhost:8000/docs
+#   RabbitMQ console http://localhost:15672 (guest/guest)
+name: videoplatform
+
+x-service: &service
+  restart: unless-stopped
+  networks: [vp]
+
+x-infra-env: &infra-env
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/%2F
+  REDIS_URL: redis://redis:6379/0
+  STORAGE_ROOT: /data
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  # ------------------------------------------------------------------ infra
+  mysql:
+    <<: *service
+    image: mysql:8.0
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_pw}
+      UPLOAD_DB_PASSWORD: ${UPLOAD_DB_PASSWORD:-upload_pw}
+      METADATA_DB_PASSWORD: ${METADATA_DB_PASSWORD:-metadata_pw}
+      ORCHESTRATOR_DB_PASSWORD: ${ORCHESTRATOR_DB_PASSWORD:-orchestrator_pw}
+      TRANSCODER_DB_PASSWORD: ${TRANSCODER_DB_PASSWORD:-transcoder_pw}
+      THUMBNAIL_DB_PASSWORD: ${THUMBNAIL_DB_PASSWORD:-thumbnail_pw}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./infra/mysql/init.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  rabbitmq:
+    <<: *service
+    image: rabbitmq:3.13-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports: ["15672:15672"]
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  redis:
+    <<: *service
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # --------------------------------------------------------------- services
+  upload:
+    <<: *service
+    build: { context: ., dockerfile: services/upload/Dockerfile }
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: upload
+      DATABASE_URL: mysql+pymysql://vp_upload:${UPLOAD_DB_PASSWORD:-upload_pw}@mysql:3306/vp_upload?charset=utf8mb4
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-524288000}
+    volumes: [media:/data]
+    depends_on: &deps
+      mysql: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  metadata:
+    <<: *service
+    build: { context: ., dockerfile: services/metadata/Dockerfile }
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: metadata
+      DATABASE_URL: mysql+pymysql://vp_metadata:${METADATA_DB_PASSWORD:-metadata_pw}@mysql:3306/vp_metadata?charset=utf8mb4
+    volumes: ["media:/data:ro"]
+    depends_on: *deps
+
+  orchestrator:
+    <<: *service
+    build: { context: ., dockerfile: services/orchestrator/Dockerfile }
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: orchestrator
+      DATABASE_URL: mysql+pymysql://vp_orchestrator:${ORCHESTRATOR_DB_PASSWORD:-orchestrator_pw}@mysql:3306/vp_orchestrator?charset=utf8mb4
+      METADATA_SERVICE_URL: http://metadata:8000
+    depends_on: *deps
+
+  transcoder:
+    <<: *service
+    build: { context: ., dockerfile: services/transcoder/Dockerfile }
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: transcoder
+      DATABASE_URL: mysql+pymysql://vp_transcoder:${TRANSCODER_DB_PASSWORD:-transcoder_pw}@mysql:3306/vp_transcoder?charset=utf8mb4
+      SIMULATE_FAILURE_ATTEMPTS: ${SIMULATE_FAILURE_ATTEMPTS:-0}
+    volumes: [media:/data]
+    depends_on: *deps
+    # scale encoders independently:  docker compose up -d --scale transcoder=3
+
+  thumbnail:
+    <<: *service
+    build: { context: ., dockerfile: services/thumbnail/Dockerfile }
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: thumbnail
+      DATABASE_URL: mysql+pymysql://vp_thumbnail:${THUMBNAIL_DB_PASSWORD:-thumbnail_pw}@mysql:3306/vp_thumbnail?charset=utf8mb4
+    volumes: [media:/data]
+    depends_on: *deps
+
+  media:
+    <<: *service
+    build: { context: ., dockerfile: services/media/Dockerfile }
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: media
+      MEDIA_SIGNING_SECRET: ${MEDIA_SIGNING_SECRET:-change-me-in-production}
+      TRANSCODER_SERVICE_URL: http://transcoder:8000
+      THUMBNAIL_SERVICE_URL: http://thumbnail:8000
+      METADATA_SERVICE_URL: http://metadata:8000
+    volumes: ["media:/data:ro"]
+    depends_on: [transcoder, thumbnail]
+
+  gateway:
+    <<: *service
+    build: { context: ., dockerfile: services/gateway/Dockerfile }
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: gateway
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-524288000}
+      UPLOAD_SERVICE_URL: http://upload:8000
+      METADATA_SERVICE_URL: http://metadata:8000
+      ORCHESTRATOR_SERVICE_URL: http://orchestrator:8000
+      TRANSCODER_SERVICE_URL: http://transcoder:8000
+      THUMBNAIL_SERVICE_URL: http://thumbnail:8000
+      MEDIA_SERVICE_URL: http://media:8000
+      CORS_ORIGINS: "*"
+    ports: ["8000:8000"]
+    depends_on: [upload, metadata, orchestrator, transcoder, thumbnail, media]
+
+  frontend:
+    <<: *service
+    build: { context: ./frontend }
+    ports: ["3000:80"]
+    depends_on: [gateway]
+
+networks:
+  vp: {}
+
+volumes:
+  mysql-data:
+  rabbitmq-data:
+  redis-data:
+  media:
